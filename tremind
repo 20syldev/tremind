@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+# tremind: reminders that survive a reboot, shown as desktop notifications.
+#
+#   tremind add --at "2027-04-15 09:30" --body "Renew the domain"
+#   tremind add --at 4d --line "Call Alex" --line "Send the invoice"
+#   tremind list | ids | presets | cancel ID | cancel --all | test | install | uninstall
+#
+# A reminder is one small file in the state folder: the due time as text and as an instant, then
+# the message. One persistent user timer (every minute) runs "tremind tick", which shows the
+# reminders that are due and removes them. The timer disables itself when no reminder is left. The
+# message lives in the state file only, never in a unit file and never in a shell string. Linux with
+# systemd (user session) and a notification daemon: see README.md.
+#
+# Environment:
+#   XDG_STATE_HOME     where the state folder is (default ~/.local/state)
+#   XDG_CONFIG_HOME    where the user units are written (default ~/.config)
+#   TREMIND_TITLE      title of the notifications (default "Rappel" under a French locale, else
+#                      "Reminder"). The timer runs tick with the environment of the systemd user
+#                      manager, not with yours.
+#   TREMIND_NOW_EPOCH  seconds since the epoch used as "now" (for tests only)
+set -euo pipefail
+umask 077
+# Bash 5.2 reads "&" in the replacement of ${var//x/y} as the matched text. Off, so "&amp;" is literal.
+shopt -u patsub_replacement 2>/dev/null || true
+
+readonly VERSION="1.0.0"
+readonly PROG="tremind"
+readonly UNIT="tremind"
+readonly ID_RE='^[0-9]{10}-[a-z0-9]{2,4}$'
+readonly WHEN_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$'
+readonly DELAY_RE='^([0-9]{1,4}[wdhm])+$'
+readonly MAX_BODY_BYTES=1000
+readonly MAX_BODY_LINES=16
+readonly MAX_AHEAD_DAYS=3650
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+usage_error() { printf '%s: %s\nTry "%s --help".\n' "$PROG" "$*" "$PROG" >&2; exit 2; }
+
+usage() {
+    cat <<'EOF'
+Usage: tremind COMMAND [ARGS]
+
+Commands:
+  add -t DELAY TEXT...     remind in DELAY (30m, 1h, 1h30m, 4d, 1w: units w d h m)
+  add --at WHEN ...        WHEN is a delay or an exact local time, "YYYY-MM-DD HH:MM"
+        --body TEXT        the message (up to 16 lines and 1000 bytes)
+        --line TEXT        one line of a list, repeatable; two or more lines get a "- " each
+  list                     pending reminders, soonest first
+  ids                      the ids of the pending reminders, one per line
+  presets                  suggestions for WHEN, one per line
+  cancel ID | --all        cancel one reminder, or all of them
+  test                     show a notification and check the setup
+  install                  write and start the user timer (add does it when needed)
+  uninstall                stop the timer and remove its units (reminders are kept)
+  tick                     show the due reminders (run by the timer, not by hand)
+
+A reminder fires within a minute after its time: "in 30 minutes" is 30 to 31 minutes.
+EOF
+}
+
+# ---- Paths -----------------------------------------------------------------------------------
+
+state_dir() {
+    local base=${XDG_STATE_HOME:-}
+    [[ $base == /* ]] || base="${HOME:?HOME is not set}/.local/state"
+    printf '%s/%s' "$base" "$PROG"
+}
+
+unit_dir() {
+    local base=${XDG_CONFIG_HOME:-}
+    [[ $base == /* ]] || base="${HOME:?HOME is not set}/.config"
+    printf '%s/systemd/user' "$base"
+}
+
+# unit_state_dir: the state folder the installed timer reads, "" when no unit is installed. It is the
+# XDG_STATE_HOME recorded in the unit, or the default one.
+unit_state_dir() {
+    local file line base
+    file="$(unit_dir)/$UNIT.service"
+    [[ -f $file ]] || return 0
+    base="${HOME:?HOME is not set}/.local/state"
+    while IFS= read -r line; do
+        if [[ $line =~ ^Environment=\"XDG_STATE_HOME=(/.*)\"$ ]]; then
+            base=${BASH_REMATCH[1]//%%/%}
+        fi
+    done <"$file"
+    printf '%s/%s' "$base" "$PROG"
+}
+
+# ---- Time ------------------------------------------------------------------------------------
+
+now_epoch() {
+    if [[ -n ${TREMIND_NOW_EPOCH:-} ]]; then
+        [[ $TREMIND_NOW_EPOCH =~ ^[0-9]{1,12}$ ]] || die "TREMIND_NOW_EPOCH must be a number of seconds"
+        printf '%d' "$((10#$TREMIND_NOW_EPOCH))"
+    else
+        date +%s
+    fi
+}
+
+format_epoch() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
+
+# delay_seconds 1h30m -> 5400. Fails for anything that is not a delay or that is zero.
+delay_seconds() {
+    local rest=$1 total=0 n
+    [[ $rest =~ $DELAY_RE ]] || return 1
+    while [[ $rest =~ ^([0-9]{1,4})([wdhm])(.*)$ ]]; do
+        n=$((10#${BASH_REMATCH[1]}))
+        case ${BASH_REMATCH[2]} in
+            w) total=$((total + n * 604800)) ;;
+            d) total=$((total + n * 86400)) ;;
+            h) total=$((total + n * 3600)) ;;
+            m) total=$((total + n * 60)) ;;
+        esac
+        rest=${BASH_REMATCH[3]}
+    done
+    ((total > 0)) || return 1
+    printf '%d' "$total"
+}
+
+# resolve_when VALUE: set WHEN_EPOCH (the instant) and WHEN_DUE ("YYYY-MM-DD HH:MM", local time, for
+# display), or print an error on stderr and return 1. A delay is added to now and rounded up to the
+# next minute; an exact time must exist, must not be before the current minute and must be at most
+# MAX_AHEAD_DAYS days away. The instant is what counts: a reminder does not move with the clock
+# change of autumn or with a change of time zone. An exact time in the hour that the clock repeats
+# is the later of the two (the one GNU date picks: winter time).
+WHEN_EPOCH=0
+WHEN_DUE=""
+resolve_when() {
+    local value=$1 now secs epoch limit canon
+    now=$(now_epoch)
+    limit=$(((now + 59) / 60 * 60 + MAX_AHEAD_DAYS * 86400))
+    if [[ $value =~ $DELAY_RE ]]; then
+        secs=$(delay_seconds "$value") || { warn "invalid delay: $value"; return 1; }
+        epoch=$(((now + secs + 59) / 60 * 60))
+    elif [[ $value =~ $WHEN_RE ]]; then
+        epoch=$(date -d "$value" +%s 2>/dev/null) || { warn "not a valid time here (no such date, or skipped by a clock change): $value"; return 1; }
+        canon=$(format_epoch "$epoch")
+        [[ $canon == "$value" ]] || { warn "that time does not exist here: $value"; return 1; }
+        ((epoch >= now / 60 * 60)) || { warn "that time is in the past: $value"; return 1; }
+    else
+        warn "invalid time: $value (use a delay such as 30m, 1h30m, 4d, or YYYY-MM-DD HH:MM)"
+        return 1
+    fi
+    ((epoch <= limit)) || { warn "too far ahead (at most $MAX_AHEAD_DAYS days): $value"; return 1; }
+    WHEN_EPOCH=$epoch
+    WHEN_DUE=$(format_epoch "$epoch")
+}
+
+# ---- Message ---------------------------------------------------------------------------------
+
+# check_body TEXT: the rules of a message. Bytes are counted in the C locale.
+check_body() {
+    local body=$1 rest newlines
+    local LC_ALL=C
+    printf '%s' "$body" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || { warn "the message is not valid UTF-8"; return 1; }
+    [[ -n ${body//[[:space:]]/} ]] || { warn "the message is empty"; return 1; }
+    ((${#body} <= MAX_BODY_BYTES)) || { warn "the message is longer than $MAX_BODY_BYTES bytes"; return 1; }
+    newlines=${body//[^$'\n']/}
+    ((${#newlines} + 1 <= MAX_BODY_LINES)) || { warn "the message has more than $MAX_BODY_LINES lines"; return 1; }
+    rest=${body//$'\n'/}
+    [[ $rest =~ [[:cntrl:]] ]] && { warn "the message holds a control character"; return 1; }
+    # Invisible characters that can disguise text: C1 controls (U+0080..U+009F), U+061C, the zero-width
+    # space and the left-to-right and right-to-left marks (U+200B, U+200E, U+200F), the line and
+    # paragraph separators and the bidirectional controls (U+2028..U+202E), the word joiner and the
+    # invisible operators (U+2060..U+2064), the bidirectional isolates (U+2066..U+2069), and U+FEFF.
+    # The zero-width joiner and non-joiner (U+200D, U+200C) stay: emoji sequences and Persian or
+    # Indic text need them.
+    case $rest in
+        *$'\xc2'[$'\x80'-$'\x9f']* | *$'\xd8\x9c'* | *$'\xe2\x80\x8b'* | *$'\xe2\x80'[$'\x8e'-$'\x8f']* | *$'\xe2\x80'[$'\xa8'-$'\xae']* | *$'\xe2\x81'[$'\xa0'-$'\xa4']* | *$'\xe2\x81'[$'\xa6'-$'\xa9']* | *$'\xef\xbb\xbf'*)
+            warn "the message holds an invisible or bidirectional control character"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# trim_blank_lines TEXT: drop the blank lines at both ends.
+trim_blank_lines() {
+    local text=$1
+    while [[ $text == $'\n'* ]]; do text=${text#$'\n'}; done
+    while [[ $text == *$'\n' ]]; do text=${text%$'\n'}; done
+    printf '%s' "$text"
+}
+
+# ---- State -----------------------------------------------------------------------------------
+
+lock_state() {
+    local dir
+    dir=$(state_dir)
+    mkdir -p -m 0700 "$dir" || die "cannot create $dir"
+    command -v flock >/dev/null 2>&1 || die "flock is required (package util-linux)"
+    exec 9>"$dir/.lock" || die "cannot open the lock in $dir"
+    flock -w 15 9 || die "another tremind is busy, try again"
+    recover_orphans
+}
+
+# recover_orphans: a file left as .fire.ID is from a tick that died between taking it and showing
+# it. The caller holds the lock, so no tick is working on it. It goes back under its id.
+recover_orphans() {
+    local dir orphan id
+    dir=$(state_dir)
+    shopt -s nullglob
+    for orphan in "$dir"/.fire.*; do
+        id=${orphan##*.fire.}
+        [[ $id =~ $ID_RE ]] && { mv -n -- "$orphan" "$dir/$id" || true; }
+    done
+    shopt -u nullglob
+}
+
+# state_files: the path of every well-formed state file, soonest first (ids sort by due time).
+state_files() {
+    local dir f
+    dir=$(state_dir)
+    shopt -s nullglob
+    for f in "$dir"/*; do
+        [[ -f $f && ${f##*/} =~ $ID_RE ]] && printf '%s\n' "$f"
+    done
+    shopt -u nullglob
+}
+
+# read_meta FILE: set META_DUE and META_EPOCH, or fail when the file is not in the expected shape.
+META_DUE=""
+META_EPOCH=0
+read_meta() {
+    local first second third
+    {
+        IFS= read -r first && IFS= read -r second && IFS= read -r third
+    } <"$1" || return 1
+    [[ $first == due=* && ${first#due=} =~ $WHEN_RE ]] || return 1
+    [[ $second =~ ^epoch=[0-9]{1,12}$ ]] || return 1
+    [[ -z $third ]] || return 1
+    META_DUE=${first#due=}
+    META_EPOCH=${second#epoch=}
+}
+
+read_body() { sed '1,3d' "$1"; }
+
+make_id() {
+    local due=$1 chars=abcdefghijklmnopqrstuvwxyz0123456789 suffix="" i
+    for i in 1 2 3; do suffix+=${chars:RANDOM % 36:1}; done
+    printf '%s%s%s%s%s-%s' "${due:2:2}" "${due:5:2}" "${due:8:2}" "${due:11:2}" "${due:14:2}" "$suffix"
+}
+
+# ---- systemd ---------------------------------------------------------------------------------
+
+# The lock (fd 9) is not given to systemctl: a child that outlives us must not keep it.
+systemctl_user() { systemctl --user "$@" 9>&-; }
+
+# unit_quote KIND TEXT: quote a value for a unit file. KIND is "exec" (ExecStart, where $ and % are
+# special) or "env" (Environment, where only % is).
+unit_quote() {
+    local kind=$1 s=$2
+    [[ $s != *$'\n'* ]] || die "a path with a newline cannot go in a unit file"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//%/%%}
+    [[ $kind == exec ]] && s=${s//\$/\$\$}
+    printf '"%s"' "$s"
+}
+
+self_path() { readlink -f "${BASH_SOURCE[0]}"; }
+
+# unit_paths_ok: the paths that go in the service unit must be ones we can quote safely.
+unit_paths_ok() {
+    local path
+    for path in "$(self_path)" "${XDG_STATE_HOME:-}"; do
+        if [[ $path == *[$'\001'-$'\037\177"\\$\'']* ]]; then
+            warn "a path with a control character, a quote, a backslash or a dollar cannot go in a unit file: $path"
+            return 1
+        fi
+    done
+}
+
+# service_text: the unit that runs tick. bash is named in it, so the script needs no execute bit.
+service_text() {
+    printf '[Unit]\nDescription=tremind: show the due reminders\n\n[Service]\nType=oneshot\n'
+    # The folder the user's session uses must be the one the timer's tick reads.
+    if [[ ${XDG_STATE_HOME:-} == /* ]]; then
+        printf 'Environment=%s\n' "$(unit_quote env "XDG_STATE_HOME=$XDG_STATE_HOME")"
+    fi
+    printf 'ExecStart=/usr/bin/env bash %s tick\n' "$(unit_quote exec "$(self_path)")"
+}
+
+timer_text() {
+    printf '[Unit]\nDescription=tremind: look for due reminders every minute\n\n'
+    printf '[Timer]\nOnCalendar=minutely\nPersistent=true\nAccuracySec=1s\n\n'
+    printf '[Install]\nWantedBy=timers.target\n'
+}
+
+# write_unit FILE TEXT: write the file when it differs and set unit_changed=1 then. Fails only when
+# it cannot write. These functions are called from an "if", where "set -e" does not apply, so every
+# step that can fail is checked by hand.
+unit_changed=0
+write_unit() {
+    local file=$1 text=$2 tmp
+    if [[ -f $file && $(<"$file") == "$text" ]]; then
+        return 0
+    fi
+    tmp=$(mktemp "$file.XXXXXX") || return 1
+    printf '%s\n' "$text" >"$tmp" || return 1
+    mv -f -- "$tmp" "$file" || return 1
+    unit_changed=1
+}
+
+install_units() {
+    local dir
+    dir=$(unit_dir)
+    unit_changed=0
+    mkdir -p "$dir" || { warn "cannot create $dir"; return 1; }
+    write_unit "$dir/$UNIT.service" "$(service_text)" || { warn "cannot write the unit in $dir"; return 1; }
+    write_unit "$dir/$UNIT.timer" "$(timer_text)" || { warn "cannot write the unit in $dir"; return 1; }
+    if ((unit_changed)); then
+        systemctl_user daemon-reload || { warn "cannot reach the systemd user manager (is XDG_RUNTIME_DIR set?)"; return 1; }
+    fi
+    start_timer
+}
+
+start_timer() {
+    systemctl_user enable --now "$UNIT.timer" >/dev/null 2>&1 || {
+        warn "cannot start $UNIT.timer in the systemd user manager (is XDG_RUNTIME_DIR set?)"
+        return 1
+    }
+}
+
+# state_has_files DIR: true when DIR holds a reminder.
+state_has_files() {
+    local f
+    shopt -s nullglob
+    for f in "$1"/*; do
+        if [[ -f $f && ${f##*/} =~ $ID_RE ]]; then
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
+# ensure_timer: units written and current, timer running. Fails with a message on stderr. It refuses
+# to point the timer at another state folder while the folder it reads still holds reminders: they
+# would never fire.
+ensure_timer() {
+    local dir old
+    command -v systemctl >/dev/null 2>&1 || { warn "systemctl is required: tremind needs systemd"; return 1; }
+    unit_paths_ok || return 1
+    old=$(unit_state_dir)
+    if [[ -n $old && $old != "$(state_dir)" ]] && state_has_files "$old"; then
+        warn "the timer reads $old, where reminders are waiting, and this run uses $(state_dir): use the same XDG_STATE_HOME as before, or cancel them"
+        return 1
+    fi
+    dir=$(unit_dir)
+    if [[ -f $dir/$UNIT.service && $(<"$dir/$UNIT.service") == "$(service_text)" &&
+        -f $dir/$UNIT.timer && $(<"$dir/$UNIT.timer") == "$(timer_text)" ]]; then
+        if systemctl_user is-active --quiet "$UNIT.timer"; then
+            return 0
+        fi
+        start_timer
+        return
+    fi
+    install_units
+}
+
+disarm_if_idle() {
+    state_has_files "$(state_dir)" && return 0
+    systemctl_user disable --now "$UNIT.timer" >/dev/null 2>&1 || true
+}
+
+# ---- Notification ----------------------------------------------------------------------------
+
+notification_title() {
+    local loc=${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}
+    if [[ -n ${TREMIND_TITLE:-} ]]; then
+        printf '%s' "$TREMIND_TITLE"
+    elif [[ $loc == fr* ]]; then
+        printf 'Rappel'
+    else
+        printf 'Reminder'
+    fi
+}
+
+# markup_escape TEXT: the body of a notification is Pango markup on most daemons.
+markup_escape() {
+    local s=$1
+    s=${s//&/&amp;}
+    s=${s//</&lt;}
+    s=${s//>/&gt;}
+    printf '%s' "$s"
+}
+
+# notify TITLE BODY: sticky notification; the text is one argument after "--", never a shell string.
+# notify-send reads backslash sequences in the body (\n, \t, \033 become characters, a trailing
+# backslash is lost), so each backslash is doubled. The title is plain text. A daemon that hangs
+# must not hold the lock for long, hence timeout. The lock (fd 9) is not given to notify-send.
+notify() {
+    local body=$2
+    body=${body//\\/\\\\}
+    body=$(markup_escape "$body")
+    timeout 8 notify-send -u normal -t 0 -i appointment-soon -a "$PROG" -- "$1" "$body" 9>&-
+}
+
+# ---- Commands --------------------------------------------------------------------------------
+
+cmd_add() {
+    local when="" body="" have_body=0 words=() lines=() line text due id dir file tmp n
+    while (($#)); do
+        case $1 in
+            --at | -t)
+                (($# >= 2)) || usage_error "$1 needs a value"
+                when=$2
+                shift 2
+                ;;
+            --at=* | -t=*)
+                when=${1#*=}
+                shift
+                ;;
+            --body)
+                (($# >= 2)) || usage_error "--body needs a value"
+                body=$2 have_body=1
+                shift 2
+                ;;
+            --body=*)
+                body=${1#--body=} have_body=1
+                shift
+                ;;
+            --line)
+                (($# >= 2)) || usage_error "--line needs a value"
+                lines+=("$2")
+                shift 2
+                ;;
+            --line=*)
+                lines+=("${1#--line=}")
+                shift
+                ;;
+            --)
+                shift
+                words+=("$@")
+                break
+                ;;
+            -*) usage_error "unknown option: $1" ;;
+            *)
+                words+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [[ -n $when ]] || usage_error "when? use --at WHEN or -t DELAY"
+    if ((${#words[@]})); then
+        ((have_body == 0)) || usage_error "give the message with --body or as words, not both"
+        body="${words[*]}"
+    fi
+
+    # The message: the body, then the list. A single line is plain text; two or more get a "- ".
+    body=${body//$'\r\n'/$'\n'}
+    local kept=()
+    for line in "${lines[@]+"${lines[@]}"}"; do
+        line=${line//$'\r'/}
+        [[ $line != *$'\n'* ]] || usage_error "a --line must be one line: use --body for several"
+        [[ -n ${line//[[:space:]]/} ]] || continue
+        kept+=("$line")
+    done
+    text=$(trim_blank_lines "$body")
+    n=${#kept[@]}
+    for line in "${kept[@]+"${kept[@]}"}"; do
+        ((n >= 2)) && line="- $line"
+        text+="${text:+$'\n'}$line"
+    done
+    [[ -n $text ]] || usage_error "the message is empty"
+    check_body "$text" || exit 1
+    resolve_when "$when" || exit 1
+    due=$WHEN_DUE
+
+    lock_state
+    dir=$(state_dir)
+    for _ in 1 2 3 4 5; do
+        id=$(make_id "$due")
+        file="$dir/$id"
+        [[ -e $file ]] || break
+    done
+    [[ ! -e $file ]] || die "could not find a free id, try again"
+    tmp=$(mktemp "$dir/.new.XXXXXX")
+    printf 'due=%s\nepoch=%s\n\n%s\n' "$due" "$WHEN_EPOCH" "$text" >"$tmp"
+    mv -n -- "$tmp" "$file"
+    if ! ensure_timer; then
+        # No timer, no reminder: do not leave one that would never fire.
+        rm -f -- "$file"
+        exit 1
+    fi
+    printf 'Reminder %s on %s\n' "$id" "$due"
+}
+
+cmd_list() {
+    local f id text first lines found=0
+    # Cut on characters whatever the caller's locale (the plugin runs us with none).
+    local LC_ALL=C.UTF-8
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        id=${f##*/}
+        read_meta "$f" || { warn "skipping $id: unreadable"; continue; }
+        text=$(read_body "$f") || continue
+        first=${text%%$'\n'*}
+        lines=$(printf '%s\n' "$text" | wc -l)
+        ((${#first} <= 60)) || first="${first:0:59}…"
+        ((lines <= 1)) || first+="  [+$((lines - 1)) lines]"
+        if ((found == 0)); then
+            printf '%-14s %-16s %s\n' ID WHEN MESSAGE
+            found=1
+        fi
+        printf '%-14s %-16s %s\n' "$id" "$META_DUE" "$first"
+    done < <(state_files)
+    ((found)) || printf 'No pending reminder.\n'
+}
+
+cmd_ids() {
+    local f
+    while IFS= read -r f; do
+        [[ -n $f ]] && printf '%s\n' "${f##*/}"
+    done < <(state_files)
+    return 0
+}
+
+cmd_presets() {
+    local now tomorrow
+    printf '%s\n' 5m 10m 30m 1h 2h 4h 1d 3d 1w
+    now=$(now_epoch)
+    # Tomorrow by the calendar (from noon, so that a clock change cannot skip or repeat a day).
+    tomorrow=$(date -d "$(date -d "@$now" +%Y-%m-%d) 12:00 +1 day" +%Y-%m-%d)
+    printf '%s 09:00\n' "$tomorrow"
+    printf '%s 18:00\n' "$tomorrow"
+}
+
+cmd_cancel() {
+    local literal=0 id f
+    if [[ ${1:-} == -- ]]; then
+        literal=1
+        shift
+    fi
+    (($# == 1)) || usage_error "cancel takes one id, or --all"
+    lock_state
+    if ((literal == 0)) && [[ $1 == --all ]]; then
+        while IFS= read -r f; do
+            [[ -n $f ]] && rm -f -- "$f"
+        done < <(state_files)
+        disarm_if_idle
+        printf 'All reminders cancelled.\n'
+        return 0
+    fi
+    id=$1
+    [[ $id =~ $ID_RE ]] || die "not a reminder id: $id"
+    f="$(state_dir)/$id"
+    [[ -f $f ]] || die "no such reminder: $id"
+    rm -f -- "$f"
+    disarm_if_idle
+    printf 'Reminder %s cancelled.\n' "$id"
+}
+
+cmd_tick() {
+    local dir f id now text fired failed=0 left=0 title
+    lock_state
+    dir=$(state_dir)
+    now=$(now_epoch)
+    title=$(notification_title)
+
+    while IFS= read -r f; do
+        [[ -n $f ]] || continue
+        id=${f##*/}
+        read_meta "$f" || { warn "skipping $id: unreadable"; left=$((left + 1)); continue; }
+        if ((META_EPOCH > now)); then
+            left=$((left + 1))
+            continue
+        fi
+        command -v notify-send >/dev/null 2>&1 || {
+            warn "notify-send is missing (package libnotify-bin): $id kept"
+            failed=1
+            left=$((left + 1))
+            continue
+        }
+        # Take the file first: a reminder is shown once, even if two ticks overlap. A tick that dies
+        # between here and the end can show it again at the next tick, and never loses it.
+        fired="$dir/.fire.$id"
+        mv -n -- "$f" "$fired" || continue
+        text=$(read_body "$fired")
+        [[ -n $text ]] || text="(empty)"
+        if notify "$title" "$text"; then
+            rm -f -- "$fired"
+            printf 'fired %s\n' "$id"
+        else
+            warn "could not show $id, it stays for the next tick"
+            mv -n -- "$fired" "$f" || true
+            failed=1
+            left=$((left + 1))
+        fi
+    done < <(state_files)
+
+    ((left > 0)) || disarm_if_idle
+    return "$failed"
+}
+
+cmd_test() {
+    local ok=0 pending dir
+    if command -v notify-send >/dev/null 2>&1; then
+        printf 'notify-send:  found\n'
+    else
+        printf 'notify-send:  MISSING (package libnotify-bin)\n'
+        ok=1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl_user show-environment >/dev/null 2>&1; then
+        printf 'systemd user: reachable\n'
+    else
+        printf 'systemd user: NOT reachable (is XDG_RUNTIME_DIR set?)\n'
+        ok=1
+    fi
+    dir=$(unit_dir)
+    if [[ -f $dir/$UNIT.service && $(<"$dir/$UNIT.service") == "$(service_text)" && -f $dir/$UNIT.timer && $(<"$dir/$UNIT.timer") == "$(timer_text)" ]]; then
+        printf 'units:        current\n'
+    else
+        printf 'units:        not installed, or for another script path (the next add fixes it)\n'
+    fi
+    if systemctl_user is-active --quiet "$UNIT.timer" 2>/dev/null; then
+        printf 'timer:        active\n'
+    else
+        printf 'timer:        not running (the next add starts it)\n'
+    fi
+    pending=$(state_files | wc -l)
+    printf 'pending:      %d\n' "$pending"
+    printf 'state folder: %s\n' "$(state_dir)"
+    if command -v notify-send >/dev/null 2>&1; then
+        notify "$(notification_title)" "tremind works" || { printf 'notification: FAILED\n'; ok=1; }
+    fi
+    return "$ok"
+}
+
+cmd_install() { ensure_timer || exit 1; printf 'Timer installed in %s\n' "$(unit_dir)"; }
+
+cmd_uninstall() {
+    local dir
+    dir=$(unit_dir)
+    command -v systemctl >/dev/null 2>&1 || die "systemctl is required: tremind needs systemd"
+    systemctl_user disable --now "$UNIT.timer" >/dev/null 2>&1 || true
+    rm -f -- "$dir/$UNIT.timer" "$dir/$UNIT.service"
+    systemctl_user daemon-reload >/dev/null 2>&1 || true
+    printf 'Timer removed. Pending reminders are kept in %s\n' "$(state_dir)"
+}
+
+main() {
+    (($# >= 1)) || { usage >&2; exit 2; }
+    [[ -n ${HOME:-} ]] || die "HOME is not set"
+    local cmd=$1
+    shift
+    case $cmd in
+        add) cmd_add "$@" ;;
+        list | ls) cmd_list ;;
+        ids) cmd_ids ;;
+        presets) cmd_presets ;;
+        cancel) cmd_cancel "$@" ;;
+        tick) cmd_tick ;;
+        test) cmd_test ;;
+        install) cmd_install ;;
+        uninstall) cmd_uninstall ;;
+        -h | --help | help) usage ;;
+        -V | --version | version) printf '%s %s\n' "$PROG" "$VERSION" ;;
+        *) usage_error "unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"
