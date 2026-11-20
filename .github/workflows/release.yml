@@ -1,0 +1,66 @@
+name: release
+
+# A push of a tag that is the version of tremind (1.0.0, without "v") runs the tests, builds
+# dist/tremind and its .sha256 with tools/package.sh, and creates a DRAFT release with both files.
+# The maintainer reads the draft, adds the notes and publishes it by hand. Nothing else triggers
+# this workflow: no push to a branch, no pull request, no schedule.
+#
+# NOT RUN YET on GitHub: the repository was prepared locally. What is known to work is
+# tests/run.sh and tools/package.sh, run by hand. What can only be checked on the first real tag:
+#   - the commit pin of the checkout action, copied from the release workflow of tote;
+#   - gh release create without --title: the title of the draft must stay empty (check it).
+
+on:
+    push:
+        tags: ["[0-9]*.[0-9]*.[0-9]*"]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: release
+    cancel-in-progress: false
+
+jobs:
+    release:
+        name: Draft release
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: write
+        steps:
+            # Same commit as the release workflow of tote (v7.0.1).
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+            - name: Check the tag
+              run: |
+                  re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+                  re+='(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+                  re+='(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+                  if ! [[ "$GITHUB_REF_NAME" =~ $re ]]; then
+                      echo "::error::$GITHUB_REF_NAME is not a version such as 1.0.0 or 1.1.0-beta.1 (no v)"
+                      exit 1
+                  fi
+                  if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+                      echo "::error::$GITHUB_REF_NAME does not point at a commit of master"
+                      exit 1
+                  fi
+            - name: Run the tests
+              run: tests/run.sh
+            - name: Build the release files
+              # Also checks that the tag is the version of the script.
+              run: tools/package.sh
+            - name: Create the draft release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  sum=$(cut -d' ' -f1 dist/tremind.sha256)
+                  notes="SHA-256 of tremind: $sum"$'\n\n'
+                  notes+="The checksum proves that the file is the one published here, not who published it."
+                  extra=()
+                  case "$GITHUB_REF_NAME" in *-*) extra+=(--prerelease) ;; esac
+                  gh release create "$GITHUB_REF_NAME" \
+                      dist/tremind dist/tremind.sha256 \
+                      --draft --verify-tag --notes "$notes" "${extra[@]}"

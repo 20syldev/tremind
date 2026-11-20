@@ -1,0 +1,39 @@
+name: test
+
+# Runs the tests of tremind on every push to master and on every pull request, on the bash of Ubuntu
+# 22.04 (5.1) and of Ubuntu 24.04 (5.2). The tests use a fake systemctl, a fake notify-send and a
+# temporary folder: they never touch the session of the runner.
+#
+# NOT RUN YET on GitHub: the tests were run by hand with bash 5.2, and tools/package.sh by hand.
+
+on:
+    push:
+        branches: [master]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        name: Tests (${{ matrix.os }})
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-22.04, ubuntu-24.04]
+        steps:
+            # Same commit as the release workflow of tote (v7.0.1).
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+              with:
+                  persist-credentials: false
+            - name: Check the syntax
+              run: |
+                  bash -n tremind
+                  bash -n tests/run.sh
+                  bash -n tools/package.sh
+            - name: Run the tests
+              run: tests/run.sh
+            - name: Build the release files
+              run: tools/package.sh
